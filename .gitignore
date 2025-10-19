@@ -1,0 +1,98 @@
+# ===============================
+# Python / Conda environment
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+.venv/
+venv/
+env/
+ENV/
+.ipynb_checkpoints/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# ===============================
+# Conda environment builds
+# ===============================
+conda_envs/
+*.yml
+
+# ===============================
+# HPC + Jupyter + VSCode metadata
+# ===============================
+*.swp
+*.swo
+*.bak
+*.tmp
+*.out
+nohup.out
+slurm-*.out
+*.sbatch
+*.job
+*.err
+*.e*
+
+# ===============================
+# Data and results
+# ===============================
+data/
+results/
+*.csv
+*.jsonl
+*.zst
+
+# ===============================
+# Hugging Face / Transformers
+# ===============================
+models/
+**/models/
+tokenizer_config.json
+special_tokens_map.json
+pytorch_model.bin
+*.safetensors
+*.h5
+*.ckpt
+*.pt
+*.bin
+
+# ===============================
+# Caches
+# ===============================
+.cache/
+.huggingface/
+transformers_cache/
+datasets/
+wandb/
+outputs/
+logs/
+runs/
+checkpoints/
+__pycache__/
+*.lock
+*.tmp
+
+# ===============================
+# Build / dist artifacts
+# ===============================
+build/
+dist/
+*.tar.gz
+*.whl
+
+# ===============================
+# OS / Misc
+# ===============================
+Thumbs.db
+ehthumbs.db
+desktop.ini
+g
