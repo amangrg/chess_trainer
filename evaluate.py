@@ -148,14 +148,9 @@ def query_model(fen, idx=None):
     board = chess.Board(fen)
 
     user_msg = (
-        f"FEN: {fen}\n\n"
-        "Think through multiple strategic approaches:\n"
-        "Path A: What move creates the most threats?\n"
-        "Path B: What move improves position most?\n"
-        "Path C: What move is safest?\n\n"
-        "After considering all paths,  output ONLY this format:\n\n"
-        "MOVE: [uci_notation]\n\n"
-        "Do not include your analysis in the output. Only output the move."
+        "You are a chess grandmaster. Given the FEN below, output ONLY the best move "
+        "in UCI notation (like e2e4, g1f3, e7e8q). No explanations, one move only."
+        f"\nFEN: {fen}\nBest move:"
     )
 
     if hasattr(tokenizer, "apply_chat_template"):
