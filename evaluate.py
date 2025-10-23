@@ -147,7 +147,6 @@ def query_model(fen, idx=None):
     """Query model and return (move_san, full_reply)."""
     board = chess.Board(fen)
 
-    # Use one of the prompts above
     user_msg = (
         f"FEN: {fen}\n\n"
         "Think through multiple strategic approaches:\n"
