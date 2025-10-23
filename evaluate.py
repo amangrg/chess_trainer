@@ -147,10 +147,16 @@ def query_model(fen, idx=None):
     """Query model and return (move_san, full_reply)."""
     board = chess.Board(fen)
 
+    # Use one of the prompts above
     user_msg = (
-        "You are a chess grandmaster. Given the FEN below, output ONLY the best move "
-        "in UCI notation (like e2e4, g1f3, e7e8q). No explanations, one move only."
-        f"\nFEN: {fen}\nBest move:"
+        f"FEN: {fen}\n\n"
+        "Think through multiple strategic approaches:\n"
+        "Path A: What move creates the most threats?\n"
+        "Path B: What move improves position most?\n"
+        "Path C: What move is safest?\n\n"
+        "After considering all paths,  output ONLY this format:\n\n"
+        "MOVE: [uci_notation]\n\n"
+        "Do not include your analysis in the output. Only output the move."
     )
 
     if hasattr(tokenizer, "apply_chat_template"):
@@ -168,7 +174,7 @@ def query_model(fen, idx=None):
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=8,
+            max_new_tokens=128,  # Increased for reasoning
             do_sample=False,
             temperature=0.0,
             pad_token_id=getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id),
@@ -178,10 +184,26 @@ def query_model(fen, idx=None):
     new_tokens = output_ids[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    # Extract possible move (UCI or SAN)
-    import re
-    uci_match = re.search(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", completion)
-    move = uci_match.group(1) if uci_match else completion.split()[-1]
+    # Enhanced extraction - look for UCI moves anywhere in response
+    uci_matches = re.findall(r'\b([a-h][1-8][a-h][1-8][qrbn]?)\b', completion.lower())
+    
+    # Try to find move after keywords
+    move = None
+    for keyword in ['move:', 'best move:', 'move is']:
+        if keyword in completion.lower():
+            after_keyword = completion.lower().split(keyword)[-1]
+            match = re.search(r'\b([a-h][1-8][a-h][1-8][qrbn]?)\b', after_keyword)
+            if match:
+                move = match.group(1)
+                break
+    
+    # Fallback to first UCI match
+    if not move and uci_matches:
+        move = uci_matches[0]
+    
+    # Last resort - try last token
+    if not move:
+        move = completion.split()[-1] if completion.split() else ""
 
     # Convert to SAN for consistency
     try:
@@ -189,7 +211,6 @@ def query_model(fen, idx=None):
     except Exception:
         san = move
 
-    # Log clearly
     print(f"[MODEL] #{idx}: FEN={fen[:25]}... → {san}")
     print(f"[FULL REPLY] {completion}\n")
 
