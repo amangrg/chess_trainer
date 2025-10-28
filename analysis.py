@@ -1,7 +1,7 @@
 import csv
 
 # Change this to your CSV filename
-csv_file = 'evaluate_Qwen_Qwen2.5-7B-Instruct prompt 2.csv'
+csv_file = 'results/evaluate_Qwen_Qwen3-4B-Instruct-2507.csv'
 
 total_moves = 0
 legal_moves = 0

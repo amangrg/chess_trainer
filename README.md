@@ -13,4 +13,4 @@ module load anaconda3
 
 conda activate /storage/ice1/9/7/agarg78/conda_envs/chess_eval
 
-python evaluate.py --dataset data/lichess_db_eval.jsonl.zst --model deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct --samples 100
+python evaluate.py --dataset data/lichess_db_eval.jsonl.zst --model Qwen/Qwen3-4B-Instruct-2507 --samples 100

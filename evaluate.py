@@ -5,7 +5,12 @@ import pandas as pd
 from tqdm import tqdm
 import chess
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from huggingface_hub import snapshot_download
 
 
@@ -84,6 +89,7 @@ t0 = time.time()
 tokenizer = AutoTokenizer.from_pretrained(local_model_dir, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     local_model_dir,
+    trust_remote_code=True,
     dtype=torch.float16 if device == "cuda" else torch.float32,
     device_map="auto",
 )
@@ -159,58 +165,76 @@ print(f"[DATA] Loaded {len(positions)} positions for evaluation.")
 
 SAN_RE = re.compile(r"\b(O-O-O|O-O|[KQRNB]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRNB])?[+#]?)\b")
 
+class StopAfterBestMove(StoppingCriteria):
+    def __init__(self, tokenizer, start_idx):
+        self.tok = tokenizer
+        self.start_idx = start_idx
+        self.marker = "best move:"
+
+    def __call__(self, input_ids, scores, **kwargs):
+        text = self.tok.decode(input_ids[0, self.start_idx:], skip_special_tokens=True)
+        i = text.lower().find(self.marker)
+        if i == -1:
+            return False
+        tail = text[i + len(self.marker):]
+        return SAN_RE.search(tail) is not None
+
+
 def query_model(fen, idx=None):
     """Query model and return (san_move, full_reply)."""
     board = chess.Board(fen)
 
-    prompt_text = (
-        "You are a world-class chess grandmaster analyzing the position below. "
-        "Breifly explain your reasoning before giving your final move. "
-        "Output exactly one line starting with 'Best Move:' after your short explanation.\n\n"
-        f"FEN: {fen}\n\n"
+    side_to_move = "White" if board.turn == chess.WHITE else "Black"
+    board_display = board.unicode(empty_square="·", borders=True)
+
+    messages = [
+        {"role": "system", "content":
+        "You are a chess assistant. Reply with exactly two lines:\n"
+        "My reasoning: <15 words max>\n"
+        "Best Move: <legal SAN only>"
+        },
+        {"role": "user", "content":
+        f"Side to move: {side_to_move}\nBoard:\n{board_display}"
+        },
+    ]
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
-
-    if idx in (0, "smoke"):
-        print(f"[PROMPT]\n{prompt_text}\n")
-
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
+
     with torch.no_grad():
+        stopping_criteria = StoppingCriteriaList([StopAfterBestMove(tokenizer, input_len)])
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1000,
-            temperature=0.1,
-            pad_token_id=getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id),
+            max_new_tokens=128,
+            do_sample=False,                 # greedy
+            no_repeat_ngram_size=5,          # curb “Answer with only …” loops
+            repetition_penalty=1.1,          # mild, optional
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             eos_token_id=getattr(tokenizer, "eos_token_id", None),
+            stopping_criteria=stopping_criteria,
         )
 
     new_tokens = output_ids[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    # Parse only AFTER the last "Best Move:"
+    # --- Parse after "Best Move:" ---
     window = completion
     j = window.lower().rfind("best move:")
-    if j != -1:
-        window = window[j + len("best move:"):].strip()
-    else:
-        window = ""  # if the marker isn't there, don't guess
+    window = window[j + len("best move:"):].strip() if j != -1 else ""
 
-    # Strict SAN match only
     san = ""
     if window:
         m = SAN_RE.search(window)
         cand = m.group(1) if m else ""
         if cand:
-            # Normalize potential noise like "+" or "#" at the end
-            cleaned = cand.strip()
-            cleaned = re.sub(r"[+#]+$", "", cleaned)  # remove trailing + or #
-
+            cleaned = re.sub(r"[+#]+$", "", cand.strip())
             try:
                 mv = board.parse_san(cleaned)
-                san = board.san(mv)  # canonical SAN (python-chess will add +/# correctly)
+                san = board.san(mv)
             except Exception:
-                # As fallback, try case-insensitive exact match against legal moves
                 for move in board.legal_moves:
                     if board.san(move).replace("+", "").replace("#", "").lower() == cleaned.lower():
                         san = board.san(move)
