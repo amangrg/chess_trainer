@@ -259,15 +259,16 @@ def train_model(train_data, val_data, model_path, tokenizer, model):
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         warmup_steps=50,
-        logging_steps=50,
-        save_steps=500,
-        eval_strategy="steps",
-        eval_steps=500,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        bf16=True,  # Use bfloat16 for H100
-        gradient_accumulation_steps=1,
+        logging_steps=200,
+        eval_steps=1000,
+        save_strategy="no",            # ⟵ no intermediate checkpoints
+        load_best_model_at_end=False,  # ⟵ don’t expect a “best” ckpt
+        save_total_limit=1,            # harmless; won’t save during training anyway
+        bf16=True,
+        gradient_accumulation_steps=16,
+        gradient_checkpointing=True,
         report_to="none",
+        overwrite_output_dir=True,     # optional: allow re-runs
     )
     
     data_collator = DataCollatorForLanguageModeling(
