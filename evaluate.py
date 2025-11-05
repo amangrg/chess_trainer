@@ -51,6 +51,7 @@ parser.add_argument("--epochs", type=int, default=2, help="Number of training ep
 parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
 parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
 parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
+parser.add_argument("--eval_dtype",choices=["fp16", "bf16", "fp32"],default="fp16",help="dtype for evaluation (fp16 recommended for many HF LLMs)")
 
 args = parser.parse_args()
 
@@ -78,6 +79,9 @@ print(f"[INIT] Results directory: {results_dir}")
 def sanitize_repo_id(repo_id: str) -> str:
     """Convert repo ID to valid directory name."""
     return repo_id.replace("/", "_").replace(":", "_")
+
+def _str_to_dtype(name: str):
+    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
 
 
 def extract_best_move(obj):
@@ -351,10 +355,21 @@ def query_model(fen, tokenizer, model, idx=None):
             f"Side to move: {side_to_move}\nBoard:\n{board_display}"
         },
     ]
-    
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        # simple instruct-style fallback
+        prompt_text = (
+            "You are a chess assistant. Reply with exactly two lines:\n"
+            "My reasoning: <15 words max>\n"
+            "Best Move: <legal SAN only>\n\n"
+            f"Side to move: {side_to_move}\nBoard:\n{board_display}\n"
+            "Answer:\n"
+        )
+
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -446,6 +461,12 @@ def evaluate_model(test_data, tokenizer, model, model_name):
     
     # Calculate metrics
     df = pd.DataFrame(records)
+    if df.empty or any(col not in df.columns for col in ("legal", "good")):
+        print("[ERROR] No successful generations; saving raw outputs for debugging.")
+        outfile = os.path.join(results_dir, f"evaluate_{sanitize_repo_id(model_name)}.csv")
+        df.to_csv(outfile, index=False)
+        return df
+
     legal_rate = df["legal"].mean() * 100
     good_rate = df["good"].mean() * 100
     
@@ -478,30 +499,38 @@ def evaluate_model(test_data, tokenizer, model, model_name):
 # =========================================================
 # Model Loading
 # =========================================================
-def load_model(model_path, for_training=False):
-    """Load model and tokenizer."""
+def load_model(model_path, for_training=False, force_dtype=None):
     print(f"\n[MODEL] Loading model from: {model_path}")
     start = time.time()
-    
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
-    
-    dtype = torch.bfloat16 if for_training else (torch.float16 if device == "cuda" else torch.float32)
-    
+
+    if force_dtype is not None:
+        dtype = force_dtype
+    else:
+        dtype = torch.bfloat16 if for_training else (torch.float16 if device == "cuda" else torch.float32)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=False,
         torch_dtype=dtype,
         device_map="auto",
+        attn_implementation="eager",   # ← avoids SDPA/Flash cache quirks
     )
-    
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
-    
+
+    # Be explicit: no KV cache anywhere
+    model.config.use_cache = False
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.use_cache = False
+
     if not for_training:
         model.eval()
-    
-    print(f"[MODEL] Loaded in {time.time()-start:.1f}s")
+
+    print(f"[MODEL] Loaded in {time.time()-start:.1f}s | dtype={dtype}")
     return tokenizer, model
 
 
@@ -549,7 +578,7 @@ def main():
     print(f"Mode: {args.mode}")
     print(f"Base model: {args.model}")
     print(f"Dataset: {args.dataset}")
-    
+    eval_dtype = _str_to_dtype(args.eval_dtype)
     # Load and split data
     if args.mode in ["train", "both"]:
         train_data, val_data, test_data = load_data_splits(
@@ -579,23 +608,23 @@ def main():
         # For "both" mode, reload the trained model for evaluation
         if args.mode == "both":
             print("\n[INFO] Reloading trained model for evaluation...")
-            tokenizer, model = load_model(args.output_dir, for_training=False)
+            tokenizer, model = load_model(args.output_dir, for_training=False, force_dtype=eval_dtype)
             model_name = f"finetuned_{sanitize_repo_id(args.model)}"
+
     
     # Evaluation phase
     if args.mode in ["eval", "both"]:
         if args.mode == "eval":
-            # Determine which model to evaluate
             if os.path.exists(args.output_dir) and os.path.isfile(
                 os.path.join(args.output_dir, "config.json")
             ):
                 print(f"[INFO] Evaluating fine-tuned model from {args.output_dir}")
-                tokenizer, model = load_model(args.output_dir, for_training=False)
+                tokenizer, model = load_model(args.output_dir, for_training=False, force_dtype=eval_dtype)
                 model_name = f"finetuned_{sanitize_repo_id(args.model)}"
             else:
                 print(f"[INFO] Evaluating base model: {args.model}")
                 local_model_path = ensure_model_downloaded(args.model)
-                tokenizer, model = load_model(local_model_path, for_training=False)
+                tokenizer, model = load_model(local_model_path, for_training=False, force_dtype=eval_dtype)
                 model_name = sanitize_repo_id(args.model)
         
         # Evaluate
