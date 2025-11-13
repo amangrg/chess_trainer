@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chess FEN Trainer</title>
+    <!--
+      We leverage the popular chessboard.js library to render the board and
+      chess.js to provide move validation and game state management. These
+      libraries are distributed under the MIT licence and can be loaded
+      directly from a CDN. The board accepts Forsyth‑Edwards Notation
+      (FEN), a standard way to describe a particular chess position【115677098837149†L133-L165】.
+    -->
+    <!-- The chessboard is built with CSS grid in styles.css, so we don't
+         include external CSS for chessboard.js. -->
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>Chess FEN Trainer</h1>
+      <p>
+        Enter a FEN string to load a position. You’ll then see the current
+        board. Play your best move and we’ll compare it against a dummy
+        Large‑Language‑Model (LLM) suggestion.
+      </p>
+      <!-- FEN input and load button -->
+      <div class="fen-controls">
+        <input
+          type="text"
+          id="fen-input"
+          class="fen-input"
+          placeholder="Enter FEN string"
+          value="rnbqk1nr/1p2ppbp/p2p2p1/8/3PP3/2N2N1P/PP3PP1/R1BQKB1R b KQkq -"
+        />
+        <button id="load-button" class="load-btn">Load Position</button>
+      </div>
+      <!-- Chessboard container -->
+      <div id="board" class="chessboard"></div>
+      <!-- Information panel -->
+      <div id="info" class="info">
+        <p id="instruction" class="instruction">Press “Load Position” to begin.</p>
+        <p id="status" class="status"></p>
+        <p id="llm-move" class="llm"></p>
+      </div>
+    </div>
+    <!--
+      Our application logic. No external dependencies are required because the
+      chessboard is rendered with vanilla JavaScript and Unicode characters. The
+      script handles FEN parsing, move generation and user interaction.
+    -->
+    <script src="script.js"></script>
+  </body>
+</html>
