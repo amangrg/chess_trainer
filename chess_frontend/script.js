@@ -41,6 +41,11 @@ let userMoved = false;
 // properties {from: 'e2', to: 'e4'}.
 let llmMove = null;
 
+// Index of the current entry from the CSV dataset. If ENTRIES is defined
+// (imported via data.js), the app cycles through these records. Otherwise
+// the user can manually enter FEN strings. 0-based index.
+let currentEntryIndex = 0;
+
 // Internal state for the currently selected square and its legal moves.
 let selectedSquare = null;
 let legalMoves = [];
@@ -52,6 +57,11 @@ const boardElement = document.getElementById('board');
 const instructionElement = document.getElementById('instruction');
 const statusElement = document.getElementById('status');
 const llmElement = document.getElementById('llm-move');
+
+
+// Navigation DOM elements (may not exist in older versions)
+const navigationElement = document.getElementById('navigation');
+const nextButton = document.getElementById('next-button');
 
 /**
  * Parse a FEN string into board state and active colour. Only the first two
@@ -464,6 +474,196 @@ function compareWithLLM(userFrom, userTo) {
 }
 
 /**
+ * Convert a move in SAN (simple algebraic notation) from the model_move
+ * column into a from/to coordinate pair. This implementation is simplified
+ * and handles common move formats such as "e4", "Nf3", "Rxf7", "Qxg7+",
+ * etc. It ignores check/mate symbols (+/#) and does not handle castling
+ * or promotion. If the SAN string cannot be parsed or no matching move
+ * exists in the generated move list, null is returned.
+ *
+ * @param {string} san The SAN string from the CSV (e.g. "Kg8", "e4", "Qd2").
+ * @returns {{from: string, to: string}|null} An object with algebraic from/to squares
+ */
+function convertModelMove(san) {
+  if (!san || san.trim() === '') return null;
+  // Remove trailing check/mate markers and whitespace
+  let moveStr = san.trim();
+  moveStr = moveStr.replace(/[+#]+$/, '');
+  // Handle castling (not supported by our pseudo‑legal generator)
+  if (/^O-O(-O)?$/.test(moveStr) || /^0-0(-0)?$/.test(moveStr)) {
+    return null;
+  }
+  // Determine if capture is indicated
+  const isCapture = moveStr.includes('x');
+  // Determine destination square
+  const destMatch = moveStr.match(/([a-h][1-8])$/);
+  if (!destMatch) return null;
+  const destSquare = destMatch[1];
+  // Determine piece type; default is pawn
+  let pieceLetter = moveStr.charAt(0);
+  let pieceType = 'p';
+  const pieces = { K: 'k', Q: 'q', R: 'r', B: 'b', N: 'n' };
+  if (pieces[pieceLetter]) {
+    pieceType = pieces[pieceLetter];
+  }
+  // Generate all pseudo‑legal moves and find ones matching destination and piece
+  const moves = generateAllMoves();
+  for (const m of moves) {
+    const fromSq = coordToSquare(m.from.row, m.from.col);
+    const toSq = coordToSquare(m.to.row, m.to.col);
+    // Check destination
+    if (toSq !== destSquare) continue;
+    const movingPiece = boardState[m.from.row][m.from.col];
+    if (!movingPiece) continue;
+    // Check piece type
+    if (movingPiece.type !== pieceType) continue;
+    // If capture indicated, ensure destination was occupied by opponent at start
+    if (isCapture) {
+      const target = boardState[m.to.row][m.to.col];
+      if (!target || target.color === movingPiece.color) continue;
+    }
+    // If not capture, ensure destination is empty
+    if (!isCapture) {
+      const target = boardState[m.to.row][m.to.col];
+      if (target) continue;
+    }
+    return { from: fromSq, to: toSq };
+  }
+  // If no match found, return null
+  return null;
+}
+
+/**
+ * Load a dataset entry at the given index. Reads the FEN and model_move
+ * from the global ENTRIES array (if available), updates the input box,
+ * parses the FEN, draws the board and computes the LLM suggestion. If the
+ * model_move is empty or cannot be parsed, falls back to a random dummy
+ * suggestion. Updates instruction text accordingly. Assumes the index is
+ * valid (0 ≤ index < ENTRIES.length).
+ *
+ * @param {number} index Index into the ENTRIES array
+ */
+function loadEntry(index) {
+  currentEntryIndex = index;
+  const entry = ENTRIES[index];
+  const fen = entry.fen;
+  fenInput.value = fen;
+  // Reset state
+  userMoved = false;
+  llmMove = null;
+  selectedSquare = null;
+  legalMoves = [];
+  statusElement.textContent = '';
+  llmElement.textContent = '';
+  instructionElement.textContent = '';
+  // Parse FEN and draw board
+  if (!parseFEN(fen)) {
+    statusElement.textContent = 'Invalid FEN in dataset entry.';
+    boardElement.innerHTML = '';
+    return;
+  }
+  drawBoard();
+  // Determine LLM move from the model_move SAN
+  const san = entry.model_move ? entry.model_move.trim() : '';
+  let parsedMove = convertModelMove(san);
+  if (!parsedMove) {
+    // If model_move is empty or parsing failed, use dummy random move
+    parsedMove = getLLMDummyMove();
+  }
+  llmMove = parsedMove;
+  highlightLLMMove();
+  // Instruction about turn
+  const side = activeColor === 'w' ? 'White' : 'Black';
+  instructionElement.textContent =
+    'Position ' + (index + 1) + ' of ' + ENTRIES.length + '. It is ' + side + "'s move. Select a piece to play your move.";
+}
+
+/**
+ * Load the next entry from the dataset. Advances the currentEntryIndex
+ * cyclically and calls loadEntry. If there is no dataset, this function
+ * does nothing.
+ */
+function loadNextEntry() {
+  if (typeof ENTRIES === 'undefined' || !Array.isArray(ENTRIES) || ENTRIES.length === 0) {
+    return;
+  }
+  const nextIndex = (currentEntryIndex + 1) % ENTRIES.length;
+  loadEntry(nextIndex);
+}
+
+/**
+ * Parse a CSV string into an array of entry objects with `fen` and
+ * `model_move` properties.  The parser handles quoted fields, escaped
+ * quotes and newlines within fields according to RFC 4180.  Only the
+ * second and third columns of each row (index 1 and 2) are used.  The
+ * header row is skipped.
+ *
+ * @param {string} csv The raw CSV text
+ * @returns {Array<{fen: string, model_move: string}>} Parsed entries
+ */
+function parseCSV(csv) {
+  const entries = [];
+  let i = 0;
+  const len = csv.length;
+  let field = '';
+  let row = [];
+  let inQuotes = false;
+  while (i < len) {
+    const char = csv[i];
+    if (inQuotes) {
+      if (char === '"') {
+        // Peek at next char to see if this is an escaped quote
+        if (i + 1 < len && csv[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += char;
+      }
+    } else {
+      if (char === '"') {
+        inQuotes = true;
+      } else if (char === ',') {
+        row.push(field);
+        field = '';
+      } else if (char === '\r') {
+        // ignore carriage returns
+      } else if (char === '\n') {
+        row.push(field);
+        field = '';
+        // Process the row if it has at least two fields (skip header)
+        if (row.length >= 3) {
+          const fen = row[1] ? row[1].trim() : '';
+          const move = row[2] ? row[2].trim() : '';
+          entries.push({ fen: fen, model_move: move });
+        }
+        row = [];
+      } else {
+        field += char;
+      }
+    }
+    i++;
+  }
+  // Handle the last line if it doesn't end with newline
+  if (field !== '' || row.length) {
+    row.push(field);
+    if (row.length >= 3 && entries.length >= 0) {
+      const fen = row[1] ? row[1].trim() : '';
+      const move = row[2] ? row[2].trim() : '';
+      entries.push({ fen: fen, model_move: move });
+    }
+  }
+  // Remove header entry if present (e.g., first row may be header)
+  if (entries.length > 0 && entries[0].fen.toLowerCase() === 'fen') {
+    entries.shift();
+  }
+  return entries;
+}
+
+
+/**
  * Event handler for the “Load Position” button. Parses the FEN string,
  * resets the internal state, draws the board, generates the LLM suggestion
  * and updates the instructional text.
@@ -500,14 +700,55 @@ function onLoadButtonClick() {
 // Attach the load button’s click handler
 loadButton.addEventListener('click', onLoadButtonClick);
 
-// Initialise the board on page load to the default FEN in the input field
+// Initialise the application on page load. If a dataset is available via
+// ENTRIES, load the first entry and show the navigation controls. Otherwise
+// fall back to the default FEN in the input field.
 window.addEventListener('DOMContentLoaded', () => {
-  const initialFen = fenInput.value;
-  if (parseFEN(initialFen)) {
-    drawBoard();
-    llmMove = getLLMDummyMove();
-    highlightLLMMove();
-    const side = activeColor === 'w' ? 'White' : 'Black';
-    instructionElement.textContent = 'It is ' + side + '\'s move. Select a piece to play your move.';
-  }
+  // Async wrapper so we can await fetch
+  (async () => {
+    // Attempt to fetch a data.csv file from the same directory. If the
+    // fetch succeeds and the file contains valid entries, override
+    // ENTRIES with the parsed dataset. Some browsers may restrict fetch
+    // on the file:// protocol; in that case this silently fails.
+    try {
+      const response = await fetch('./data.csv');
+      console.log(response,'response')
+      if (response && response.ok) {
+        const text = await response.text();
+        const parsed = parseCSV(text);
+        if (parsed && parsed.length > 0) {
+          window.ENTRIES = parsed;
+        }
+      }
+    } catch (err) {
+      console.log(err,'error')
+      // Swallow any fetch or parse errors. We fall back to whatever
+      // ENTRIES may already contain (e.g., from data.js) or manual FEN input.
+    }
+    // Attach click handler for the Next button regardless of whether a dataset is present.
+    if (nextButton) {
+      nextButton.addEventListener('click', () => {
+        loadNextEntry();
+      });
+    }
+    // Always show the navigation controls so the Next button is visible
+    if (navigationElement) {
+      navigationElement.style.display = 'block';
+    }
+    // Now proceed to initialise the UI: if we have a dataset, load it; otherwise fall back
+    if (typeof ENTRIES !== 'undefined' && Array.isArray(ENTRIES) && ENTRIES.length > 0) {
+      // Load the first entry
+      loadEntry(0);
+    } else {
+      // No dataset: initialise board from default FEN in input box
+      const initialFen = fenInput.value;
+      if (parseFEN(initialFen)) {
+        drawBoard();
+        llmMove = getLLMDummyMove();
+        highlightLLMMove();
+        const side = activeColor === 'w' ? 'White' : 'Black';
+        instructionElement.textContent = 'It is ' + side + '\'s move. Select a piece to play your move.';
+      }
+    }
+  })();
 });

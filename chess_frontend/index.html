@@ -19,9 +19,12 @@
     <div class="container">
       <h1>Chess FEN Trainer</h1>
       <p>
-        Enter a FEN string to load a position. You’ll then see the current
-        board. Play your best move and we’ll compare it against a dummy
-        Large‑Language‑Model (LLM) suggestion.
+        This trainer loads positions from a CSV of FEN strings and model‑
+        predicted moves. A file named <code>data.csv</code> should sit in the
+        same folder as this page; its positions will load automatically.
+        Use the **Next →** button below the board to step through each entry.
+        You can still type your own FEN string in the box if you wish to
+        explore a custom position.
       </p>
       <!-- FEN input and load button -->
       <div class="fen-controls">
@@ -41,6 +44,9 @@
         <p id="instruction" class="instruction">Press “Load Position” to begin.</p>
         <p id="status" class="status"></p>
         <p id="llm-move" class="llm"></p>
+        <div id="navigation" class="navigation" style="display:none;">
+          <button id="next-button" class="next-btn" title="Next position">Next →</button>
+        </div>
       </div>
     </div>
     <!--
@@ -48,6 +54,9 @@
       chessboard is rendered with vanilla JavaScript and Unicode characters. The
       script handles FEN parsing, move generation and user interaction.
     -->
+    <!-- Pre‑loaded dataset of entries parsed from the CSV. It defines a global
+         array called ENTRIES. -->
+    <script src="data.js"></script>
     <script src="script.js"></script>
   </body>
 </html>
