@@ -40,6 +40,8 @@ let userMoved = false;
 // The LLM’s suggested move, generated when a position is loaded. It has
 // properties {from: 'e2', to: 'e4'}.
 let llmMove = null;
+// Whether the LLM's suggested move is currently visible on the board.
+let llmVisible = false;
 
 // Index of the current entry from the CSV dataset. If ENTRIES is defined
 // (imported via data.js), the app cycles through these records. Otherwise
@@ -57,11 +59,15 @@ const boardElement = document.getElementById('board');
 const instructionElement = document.getElementById('instruction');
 const statusElement = document.getElementById('status');
 const llmElement = document.getElementById('llm-move');
+const fullReplyElement = document.getElementById('full-reply');
+const llmEvalElement = document.getElementById('llm-eval');
+const userMoveElement = document.getElementById('user-move');
 
 
 // Navigation DOM elements (may not exist in older versions)
 const navigationElement = document.getElementById('navigation');
 const nextButton = document.getElementById('next-button');
+// const fullReplyElement is declared above
 
 /**
  * Parse a FEN string into board state and active colour. Only the first two
@@ -360,7 +366,7 @@ function drawBoard() {
     }
   }
   // After the board is built we can apply highlights for the LLM suggestion
-  highlightLLMMove();
+  if (llmVisible) highlightLLMMove();
 }
 
 /**
@@ -445,6 +451,10 @@ function onCellClick(event) {
     const userFrom = coordToSquare(selectedSquare.row, selectedSquare.col);
     const userTo = coordToSquare(legal.to.row, legal.to.col);
     compareWithLLM(userFrom, userTo);
+    // Now that the user has played, reveal the LLM suggestion on the board
+    // and mark it so the player can compare visually.
+    llmVisible = true;
+    highlightLLMMove();
   }
   // Clear selection and highlights regardless of whether the move was legal
   clearHighlights();
@@ -466,10 +476,38 @@ function compareWithLLM(userFrom, userTo) {
   statusElement.textContent = match
     ? 'Great! Your move matches the LLM suggestion.'
     : 'Your move differs from the LLM suggestion.';
+  // Show the user's move in the labelled output area
+  if (userMoveElement) userMoveElement.textContent = userFrom + ' → ' + userTo;
   if (llmMove) {
     llmElement.textContent = 'LLM suggested move: ' + llmMove.from + ' → ' + llmMove.to;
   } else {
     llmElement.textContent = 'LLM had no suggestion for this position.';
+  }
+  // Show full_reply for gpt20b and show LLM move evaluation for all models
+  try {
+    const modelSelect = document.getElementById('model-select');
+    const entry = ENTRIES && ENTRIES[currentEntryIndex];
+    // Show full_reply only for gpt20b
+    if (modelSelect && modelSelect.value === 'gpt20b.csv' && entry && fullReplyElement) {
+      fullReplyElement.textContent = entry.full_reply || '';
+    } else if (fullReplyElement) {
+      fullReplyElement.textContent = '';
+    }
+    // Show LLM move evaluation for all models
+    if (entry && llmEvalElement) {
+      if (entry.good === true) {
+        llmEvalElement.textContent = '✅ LLM predicted move was the best move.';
+        llmEvalElement.style.color = '#059669';
+      } else if (entry.good === false) {
+        llmEvalElement.textContent = '❌ LLM predicted move was NOT the best move.';
+        llmEvalElement.style.color = '#e11d48';
+      } else {
+        llmEvalElement.textContent = '';
+        llmEvalElement.style.color = '';
+      }
+    }
+  } catch (e) {
+    console.warn('Error displaying full_reply or llmEval:', e);
   }
 }
 
@@ -555,6 +593,9 @@ function loadEntry(index) {
   legalMoves = [];
   statusElement.textContent = '';
   llmElement.textContent = '';
+  if (fullReplyElement) fullReplyElement.textContent = '';
+  if (llmEvalElement) llmEvalElement.textContent = '';
+  if (userMoveElement) userMoveElement.textContent = '';
   instructionElement.textContent = '';
   // Parse FEN and draw board
   if (!parseFEN(fen)) {
@@ -571,11 +612,12 @@ function loadEntry(index) {
     parsedMove = getLLMDummyMove();
   }
   llmMove = parsedMove;
-  highlightLLMMove();
+  // Do not show the LLM suggestion while the user is choosing their move.
+  llmVisible = false;
   // Instruction about turn
   const side = activeColor === 'w' ? 'White' : 'Black';
   instructionElement.textContent =
-    'Position ' + (index + 1) + ' of ' + ENTRIES.length + '. It is ' + side + "'s move. Select a piece to play your move.";
+    'It is ' + side + "'s move. Select a piece to play your move.";
 }
 
 /**
@@ -592,75 +634,103 @@ function loadNextEntry() {
 }
 
 /**
- * Parse a CSV string into an array of entry objects with `fen` and
- * `model_move` properties.  The parser handles quoted fields, escaped
- * quotes and newlines within fields according to RFC 4180.  Only the
- * second and third columns of each row (index 1 and 2) are used.  The
- * header row is skipped.
- *
- * @param {string} csv The raw CSV text
- * @returns {Array<{fen: string, model_move: string}>} Parsed entries
- */
-function parseCSV(csv) {
-  const entries = [];
-  let i = 0;
-  const len = csv.length;
-  let field = '';
-  let row = [];
-  let inQuotes = false;
-  while (i < len) {
-    const char = csv[i];
-    if (inQuotes) {
-      if (char === '"') {
-        // Peek at next char to see if this is an escaped quote
-        if (i + 1 < len && csv[i + 1] === '"') {
-          field += '"';
-          i++;
+    // Parse a CSV string into an array of entry objects with `fen`,
+    // `model_move` and `legal` properties. The parser handles quoted
+    // fields, escaped quotes and newlines within fields according to
+    // RFC 4180. We will skip any row where the `legal` column is
+    // explicitly "FALSE" (case-insensitive).
+    /**
+     * @param {string} csv The raw CSV text
+     * @returns {Array<{fen: string, model_move: string, legal: boolean}>} Parsed entries
+     */
+    function parseCSV(csv) {
+      const entries = [];
+      let i = 0;
+      const len = csv.length;
+      let field = '';
+      let row = [];
+      let inQuotes = false;
+      while (i < len) {
+        const char = csv[i];
+        if (inQuotes) {
+          if (char === '"') {
+            // Peek at next char to see if this is an escaped quote
+            if (i + 1 < len && csv[i + 1] === '"') {
+              field += '"';
+              i++;
+            } else {
+              inQuotes = false;
+            }
+          } else {
+            field += char;
+          }
         } else {
-          inQuotes = false;
+          if (char === '"') {
+            inQuotes = true;
+          } else if (char === ',') {
+            row.push(field);
+            field = '';
+          } else if (char === '\r') {
+            // ignore carriage returns
+          } else if (char === '\n') {
+            row.push(field);
+            field = '';
+            // Process the row if it has at least the expected fields
+            // We expect: id, fen, model_move, full_reply, legal, ...
+            if (row.length >= 5) {
+              const fen = row[1] ? row[1].trim() : '';
+              const move = row[2] ? row[2].trim() : '';
+              const legalRaw = row[4] ? row[4].trim() : '';
+              const legal = !(legalRaw.toLowerCase && legalRaw.toLowerCase() === 'false');
+              if (legal) {
+                const reply = row[3] ? row[3].trim() : '';
+                const goodRaw = row[5] ? row[5].trim() : '';
+                const good = (goodRaw.toLowerCase && goodRaw.toLowerCase() === 'true');
+                entries.push({ fen: fen, model_move: move, legal: true, full_reply: reply, good: good });
+              }
+            } else if (row.length >= 3) {
+              // Backwards-compatible: if fewer columns are present, accept the row
+              const fen = row[1] ? row[1].trim() : '';
+              const move = row[2] ? row[2].trim() : '';
+              const goodRaw = row[5] ? row[5].trim() : '';
+              const good = (goodRaw.toLowerCase && goodRaw.toLowerCase() === 'true');
+              entries.push({ fen: fen, model_move: move, legal: true, full_reply: '', good: good });
+            }
+            row = [];
+          } else {
+            field += char;
+          }
         }
-      } else {
-        field += char;
+        i++;
       }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ',') {
+      // Handle the last line if it doesn't end with newline
+      if (field !== '' || row.length) {
         row.push(field);
-        field = '';
-      } else if (char === '\r') {
-        // ignore carriage returns
-      } else if (char === '\n') {
-        row.push(field);
-        field = '';
-        // Process the row if it has at least two fields (skip header)
-        if (row.length >= 3) {
+        if (row.length >= 5) {
           const fen = row[1] ? row[1].trim() : '';
           const move = row[2] ? row[2].trim() : '';
-          entries.push({ fen: fen, model_move: move });
+          const legalRaw = row[4] ? row[4].trim() : '';
+          const legal = !(legalRaw.toLowerCase && legalRaw.toLowerCase() === 'false');
+          if (legal) {
+            const reply = row[3] ? row[3].trim() : '';
+            const goodRaw = row[5] ? row[5].trim() : '';
+            const good = (goodRaw.toLowerCase && goodRaw.toLowerCase() === 'true');
+            entries.push({ fen: fen, model_move: move, legal: true, full_reply: reply, good: good });
+          }
+        } else if (row.length >= 3) {
+          const fen = row[1] ? row[1].trim() : '';
+          const move = row[2] ? row[2].trim() : '';
+          const goodRaw = row[5] ? row[5].trim() : '';
+          const good = (goodRaw.toLowerCase && goodRaw.toLowerCase() === 'true');
+          entries.push({ fen: fen, model_move: move, legal: true, full_reply: '', good: good });
         }
-        row = [];
-      } else {
-        field += char;
       }
+      // Remove header entry if present (e.g., first row may be header)
+      if (entries.length > 0 && entries[0].fen && entries[0].fen.toLowerCase() === 'fen') {
+        entries.shift();
+      }
+      return entries;
     }
-    i++;
-  }
-  // Handle the last line if it doesn't end with newline
-  if (field !== '' || row.length) {
-    row.push(field);
-    if (row.length >= 3 && entries.length >= 0) {
-      const fen = row[1] ? row[1].trim() : '';
-      const move = row[2] ? row[2].trim() : '';
-      entries.push({ fen: fen, model_move: move });
-    }
-  }
-  // Remove header entry if present (e.g., first row may be header)
-  if (entries.length > 0 && entries[0].fen.toLowerCase() === 'fen') {
-    entries.shift();
-  }
-  return entries;
-}
 
 
 /**
@@ -677,6 +747,7 @@ function onLoadButtonClick() {
   legalMoves = [];
   statusElement.textContent = '';
   llmElement.textContent = '';
+  if (fullReplyElement) fullReplyElement.textContent = '';
   instructionElement.textContent = '';
   // Parse FEN
   if (!parseFEN(fen)) {
@@ -688,10 +759,8 @@ function onLoadButtonClick() {
   drawBoard();
   // Generate an LLM suggestion
   llmMove = getLLMDummyMove();
-  if (llmMove) {
-    // We highlight the LLM move here; the actual message is shown after the user moves
-    highlightLLMMove();
-  }
+  // Don't highlight the suggestion while the user is selecting their move.
+  llmVisible = false;
   // Show whose turn it is
   const side = activeColor === 'w' ? 'White' : 'Black';
   instructionElement.textContent = 'It is ' + side + '\'s move. Select a piece to play your move.';
@@ -706,24 +775,81 @@ loadButton.addEventListener('click', onLoadButtonClick);
 window.addEventListener('DOMContentLoaded', () => {
   // Async wrapper so we can await fetch
   (async () => {
-    // Attempt to fetch a data.csv file from the same directory. If the
-    // fetch succeeds and the file contains valid entries, override
-    // ENTRIES with the parsed dataset. Some browsers may restrict fetch
-    // on the file:// protocol; in that case this silently fails.
-    try {
-      const response = await fetch('./data.csv');
-      console.log(response,'response')
-      if (response && response.ok) {
+    // Load dataset according to the selected model CSV (or fallback to an
+    // already-included `data.js` ENTRIES variable). This supports selecting
+    // different CSV files (gpt20b.csv, mistral7b.csv, etc.) from the
+    // dropdown added to the page.
+    async function loadCSVFile(filename) {
+      try {
+        const response = await fetch(filename);
+        if (!response || !response.ok) {
+          console.warn('Could not fetch', filename, response);
+          return null;
+        }
         const text = await response.text();
         const parsed = parseCSV(text);
-        if (parsed && parsed.length > 0) {
+        if (parsed && parsed.length > 0) return parsed;
+        return null;
+      } catch (err) {
+        console.warn('Error fetching/parsing', filename, err);
+        return null;
+      }
+    }
+
+    // Helper to read the current UI selection and load data accordingly.
+    async function loadSelectedModelData() {
+      const select = document.getElementById('model-select');
+      const customInput = document.getElementById('model-custom');
+      console.log(select.value,customInput) 
+      if (!select) return;
+      const val = select.value;
+      if (val === 'other') {
+        const custom = customInput && customInput.value ? customInput.value.trim() : '';
+        
+        if (custom) {
+          const parsed = await loadCSVFile(custom);
+          if (parsed) {
+            window.ENTRIES = parsed;
+            loadEntry(0);
+            return;
+          }
+          // If custom file was provided but failed to load, clear ENTRIES so
+          // we do not fall back to a previously-loaded dataset.
+          window.ENTRIES = [];
+          instructionElement.textContent = 'Could not load "' + custom + '" — check filename and server. Showing manual FEN.';
+          console.warn('Failed to load custom CSV:', custom);
+        }
+        // If no custom file or load failed, fall through to check existing ENTRIES
+      } else if (val) {
+        console.log(val,'file name')
+        const parsed = await loadCSVFile(val);
+        if (parsed) {
           window.ENTRIES = parsed;
+          loadEntry(0);
+          return;
+        }
+        // Clear any existing ENTRIES if the requested file failed to load
+        window.ENTRIES = [];
+        instructionElement.textContent = 'Could not load "' + val + '" — check that the file exists on the server.';
+        console.warn('Failed to load CSV for selection:', val);
+      }
+      // If we get here, either fetch failed or there was no selection that
+      // produced entries. If `ENTRIES` was already defined (e.g. via data.js)
+      // use it; otherwise fall back to the manual FEN input behaviour below.
+      if (typeof ENTRIES !== 'undefined' && Array.isArray(ENTRIES) && ENTRIES.length > 0) {
+        loadEntry(0);
+      } else {
+        // No dataset available: initialise board from default FEN in input box
+        const initialFen = fenInput.value;
+        if (parseFEN(initialFen)) {
+          drawBoard();
+          llmMove = getLLMDummyMove();
+          // Do not highlight while the user has not yet played
+          llmVisible = false;
+          const side = activeColor === 'w' ? 'White' : 'Black';
+          instructionElement.textContent = 'It is ' + side + '\'s move. Select a piece to play your move.';
         }
       }
-    } catch (err) {
-      console.log(err,'error')
-      // Swallow any fetch or parse errors. We fall back to whatever
-      // ENTRIES may already contain (e.g., from data.js) or manual FEN input.
     }
     // Attach click handler for the Next button regardless of whether a dataset is present.
     if (nextButton) {
@@ -735,20 +861,49 @@ window.addEventListener('DOMContentLoaded', () => {
     if (navigationElement) {
       navigationElement.style.display = 'block';
     }
-    // Now proceed to initialise the UI: if we have a dataset, load it; otherwise fall back
-    if (typeof ENTRIES !== 'undefined' && Array.isArray(ENTRIES) && ENTRIES.length > 0) {
-      // Load the first entry
-      loadEntry(0);
-    } else {
-      // No dataset: initialise board from default FEN in input box
-      const initialFen = fenInput.value;
-      if (parseFEN(initialFen)) {
-        drawBoard();
-        llmMove = getLLMDummyMove();
-        highlightLLMMove();
-        const side = activeColor === 'w' ? 'White' : 'Black';
-        instructionElement.textContent = 'It is ' + side + '\'s move. Select a piece to play your move.';
-      }
+    // Wire up the model select UI (show/hide custom input and react to changes)
+    const modelSelect = document.getElementById('model-select');
+    const modelCustom = document.getElementById('model-custom');
+    if (modelSelect) {
+      modelSelect.addEventListener('change', (e) => {
+        // Immediately reset UI to first-entry/loading state when model changes
+        currentEntryIndex = 0;
+        userMoved = false;
+        selectedSquare = null;
+        legalMoves = [];
+        boardElement.innerHTML = '';
+        statusElement.textContent = '';
+        llmElement.textContent = '';
+        instructionElement.textContent = 'Loading selected model...';
+  if (fullReplyElement) fullReplyElement.textContent = '';
+  if (llmEvalElement) llmEvalElement.textContent = '';
+  if (userMoveElement) userMoveElement.textContent = '';
+  llmVisible = false;
+
+        if (modelCustom) {
+          if (modelSelect.value === 'other') {
+            modelCustom.style.display = 'inline-block';
+            modelCustom.focus();
+          } else {
+            modelCustom.style.display = 'none';
+          }
+        }
+        // Load dataset for newly selected model (this will call loadEntry(0) when ready)
+        loadSelectedModelData();
+      });
     }
+
+    // If user types a custom filename and presses Enter, attempt to load it
+    if (modelCustom) {
+      modelCustom.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          loadSelectedModelData();
+        }
+      });
+    }
+    console.log("Tejas")
+
+    // Initial load according to current selection (defaults to gpt20b.csv in the HTML)
+    await loadSelectedModelData();
   })();
 });

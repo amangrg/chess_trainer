@@ -26,6 +26,17 @@
         You can still type your own FEN string in the box if you wish to
         explore a custom position.
       </p>
+      <!-- Model selector: choose which CSV to load (supports adding new files) -->
+      <div class="model-selector">
+        <label for="model-select">Select model :</label>
+        <select id="model-select">
+          <option value="gpt20b.csv">gpt20b</option>
+          <option value="mistral7b.csv">mistral7b</option>
+          <!-- <option value="data.csv">data.csv (legacy)</option>
+          <option value="other">Other (enter filename)</option> -->
+        </select>
+        <input id="model-custom" type="text" placeholder="e.g. deepseek7b.csv" style="display:none; margin-left:8px;" />
+      </div>
       <!-- FEN input and load button -->
       <div class="fen-controls">
         <input
@@ -37,16 +48,34 @@
         />
         <button id="load-button" class="load-btn">Load Position</button>
       </div>
-      <!-- Chessboard container -->
-      <div id="board" class="chessboard"></div>
-      <!-- Information panel -->
-      <div id="info" class="info">
-        <p id="instruction" class="instruction">Press “Load Position” to begin.</p>
-        <p id="status" class="status"></p>
-        <p id="llm-move" class="llm"></p>
-        <div id="navigation" class="navigation" style="display:none;">
-          <button id="next-button" class="next-btn" title="Next position">Next →</button>
+      <div class="main">
+        <div class="left">
+          <!-- Chessboard container -->
+          <div id="board" class="chessboard"></div>
         </div>
+        <aside class="right info">
+          <div class="output">
+            <h3 class="output-label">LLM move</h3>
+            <p id="llm-move" class="llm">&nbsp;</p>
+          </div>
+          <div class="output">
+            <h3 class="output-label">Your move</h3>
+            <p id="user-move" class="user-move">&nbsp;</p>
+          </div>
+          <div class="output">
+            <h3 class="output-label">LLM reasoning</h3>
+            <pre id="full-reply" class="full-reply" style="white-space:pre-wrap; margin-top:8px;">&nbsp;</pre>
+          </div>
+          <div class="output">
+            <h3 class="output-label">Best move?</h3>
+            <p id="llm-eval" class="llm-eval">&nbsp;</p>
+          </div>
+          <div id="navigation" class="navigation" style="display:none; margin-top:12px;">
+            <button id="next-button" class="next-btn" title="Next position">Next →</button>
+          </div>
+          <p id="instruction" class="instruction">Press “Load Position” to begin.</p>
+          <p id="status" class="status"></p>
+        </aside>
       </div>
     </div>
     <!--
