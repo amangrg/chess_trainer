@@ -26,11 +26,18 @@ from transformers import (
     Trainer,
     DataCollatorForLanguageModeling,
     StoppingCriteria,
-    StoppingCriteriaList,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    PeftConfig,
+    PeftModel,
+    prepare_model_for_kbit_training
 )
 from datasets import Dataset
 from huggingface_hub import snapshot_download
 
+USE_LORA = False  # set False if you ever want full fine-tune again (not recommended for 20B)
 
 # =========================================================
 # CLI Arguments
@@ -40,7 +47,17 @@ parser.add_argument("--dataset", required=True, help="Path to lichess_db_eval.js
 parser.add_argument("--model", required=True, help="Hugging Face model name")
 parser.add_argument("--mode", choices=["train", "eval", "both"], default="both",
                     help="Run training, evaluation, or both")
-parser.add_argument("--output_dir", default="./finetuned_model", help="Output directory for trained model")
+# CHANGE DEFAULT HERE
+parser.add_argument(
+    "--output_dir",
+    default="./ft_model_modified",
+    help="Output directory for trained model (default: ./ft_model_modified)"
+)
+parser.add_argument(
+    "--eval_dir",
+    default=None,
+    help="Optional directory of a fine-tuned model to load in eval mode"
+)
 parser.add_argument("--eval_samples", type=int, default=100, help="Number of samples for evaluation")
 
 # Training hyperparameters
@@ -51,7 +68,8 @@ parser.add_argument("--epochs", type=int, default=2, help="Number of training ep
 parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
 parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
 parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
-parser.add_argument("--eval_dtype",choices=["fp16", "bf16", "fp32"],default="fp16",help="dtype for evaluation (fp16 recommended for many HF LLMs)")
+parser.add_argument("--eval_dtype",choices=["fp16", "bf16", "fp32"],default="fp16",
+                    help="dtype for evaluation (fp16 recommended for many HF LLMs)")
 
 args = parser.parse_args()
 
@@ -138,11 +156,49 @@ def extract_top_moves(obj, max_moves=5):
             uniq.append(m)
     return uniq[:max_moves]
 
+def extract_eval_cp(obj):
+    """
+    Extract a centipawn eval (cp) from the evals->pvs list.
+    We just take the first cp we see.
+    """
+    for ev in obj.get("evals", []):
+        for pv in ev.get("pvs", []):
+            cp = pv.get("cp")
+            if isinstance(cp, (int, float)):
+                return cp
+    return None
+
+
+def eval_bucket_from_cp(cp):
+    """
+    Map engine cp score to one of:
+    - 'equal'
+    - 'white is better'
+    - 'black is better'
+    - 'white is winning'
+    - 'black is winning'
+    """
+    if cp is None:
+        return "equal"
+
+    # cp > 0 means white is better, cp < 0 means black is better
+    if cp > 200:
+        return "white is winning"
+    elif cp > 50:
+        return "white is better"
+    elif cp < -200:
+        return "black is winning"
+    elif cp < -50:
+        return "black is better"
+    else:
+        return "equal"
+
 
 def load_data_splits(path, train_n, val_n, test_n):
     """
     Load data and split into train/val/test sets.
     Returns three lists of samples.
+    Each sample: { 'fen', 'best_move', 'top_moves', 'cp' }
     """
     print(f"[DATA] Loading {train_n + val_n + test_n} total samples from {path}")
     print(f"[DATA] Split: {train_n} train, {val_n} val, {test_n} test")
@@ -162,11 +218,13 @@ def load_data_splits(path, train_n, val_n, test_n):
                         obj = json.loads(line)
                         fen, best_move = extract_best_move(obj)
                         top_moves = extract_top_moves(obj)
+                        cp = extract_eval_cp(obj)
                         if fen and best_move and top_moves:
                             all_samples.append({
                                 "fen": fen,
                                 "best_move": best_move,
-                                "top_moves": top_moves
+                                "top_moves": top_moves,
+                                "cp": cp,
                             })
                         if len(all_samples) >= total_needed:
                             break
@@ -187,41 +245,96 @@ def load_data_splits(path, train_n, val_n, test_n):
     return train_data, val_data, test_data
 
 
+
 # =========================================================
 # Training Functions
 # =========================================================
-def format_training_example(fen, best_move, tokenizer):
-    """Format a training example."""
+def format_training_example(sample, tokenizer):
+    """
+    Format a training example as the XML template:
+
+    <board_position>the board position is FEN: {fen}</board_position>
+    <evaluate>{eval_sentence}</evaluate>
+    <perceive>{all_legal_moves_san}</perceive>
+    <predict>{top_moves_san}</predict>
+    <choose>{best_move_san}</choose>
+    """
+    fen = sample["fen"]
+    best_move = sample["best_move"]
+    top_moves = sample["top_moves"]
+    cp = sample.get("cp", None)
+
     board = chess.Board(fen)
-    side_to_move = "White" if board.turn == chess.WHITE else "Black"
-    board_display = board.unicode(empty_square="·", borders=True)
-    
+    color = "White" if board.turn == chess.WHITE else "Black"
+
+    # Bucket evaluation from cp
+    eval_bucket = eval_bucket_from_cp(cp)
+
+    # All legal moves in SAN
+    legal_moves_san = [board.san(m) for m in board.legal_moves]
+    all_legal_moves_str = " ".join(legal_moves_san)
+
+    # Top moves list (already SAN)
+    top_moves_str = ", ".join(top_moves)
+
+    # Simple explanation sentence for training
+    if cp is not None:
+        advantage_text = f"Engine score is about {cp} centipawns."
+    else:
+        advantage_text = "No exact engine score is available."
+
+    eval_text = (
+        f"{eval_bucket}. {advantage_text} "
+        f"The best move for {color} is {best_move} because it improves {color}'s position."
+    )
+
+    assistant_xml = (
+        f"<board_position>the board position is FEN: {fen}</board_position>\n"
+        f"<evaluate>{eval_text}</evaluate>\n"
+        f"<perceive>{all_legal_moves_str}</perceive>\n"
+        f"<predict>{top_moves_str}</predict>\n"
+        f"<choose>{best_move}</choose>"
+    )
+
     messages = [
-        {"role": "system", "content":
-            "You are a chess assistant. Reply with exactly two lines:\n"
-            "My reasoning: <15 words max>\n"
-            "Best Move: <legal SAN only>"
+        {
+            "role": "system",
+            "content": (
+                "You are a strong chess assistant that answers strictly in XML.\n"
+                "Fill in all of the following tags based on the given FEN:\n"
+                "<board_position>...</board_position>\n"
+                "<evaluate>...</evaluate>\n"
+                "<perceive>...</perceive>\n"
+                "<predict>...</predict>\n"
+                "<choose>...</choose>\n"
+                "In <choose>, output exactly one legal SAN move and nothing else."
+            ),
         },
-        {"role": "user", "content":
-            f"Side to move: {side_to_move}\nBoard:\n{board_display}"
+        {
+            "role": "user",
+            "content": f"FEN: {fen}",
         },
-        {"role": "assistant", "content":
-            f"My reasoning: Strong tactical position.\nBest Move: {best_move}"
-        }
+        {
+            "role": "assistant",
+            "content": assistant_xml,
+        },
     ]
-    
+
     text = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=False
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
     )
     return text
 
 
+
 def create_dataset(data, tokenizer, max_length):
-    """Convert raw data to tokenized dataset."""    
-    texts = [format_training_example(item["fen"], item["best_move"], tokenizer) 
-             for item in tqdm(data, desc="Formatting")]
+    """Convert raw data (list of dicts) to tokenized dataset."""
+    texts = [
+        format_training_example(item, tokenizer)
+        for item in tqdm(data, desc="Formatting")
+    ]
     
     def tokenize_function(examples):
         outputs = tokenizer(
@@ -244,6 +357,7 @@ def create_dataset(data, tokenizer, max_length):
     return tokenized
 
 
+
 def train_model(train_data, val_data, model_path, tokenizer, model):
     """Fine-tune the model."""
     print("\n" + "="*60)
@@ -259,26 +373,30 @@ def train_model(train_data, val_data, model_path, tokenizer, model):
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_train_batch_size=2,   # start small for 20B
+        per_device_eval_batch_size=8,
         learning_rate=args.learning_rate,
-        warmup_steps=50,
-        logging_steps=200,
-        eval_steps=1000,
-        save_strategy="no",            # ⟵ no intermediate checkpoints
-        load_best_model_at_end=False,  # ⟵ don’t expect a “best” ckpt
-        save_total_limit=1,            # harmless; won’t save during training anyway
-        bf16=True,
-        gradient_accumulation_steps=16,
-        gradient_checkpointing=True,
+        warmup_steps=10,
+        logging_steps=10,
+        eval_steps=100,
+        save_strategy="no",
+        load_best_model_at_end=False,
+        save_total_limit=1,
+        bf16=True,                       # good for H100
+        gradient_accumulation_steps=16,  # effective batch = 16
+        gradient_checkpointing=True,     # <— enable this for memory
         report_to="none",
-        overwrite_output_dir=True,     # optional: allow re-runs
+        overwrite_output_dir=True,
+        optim="adamw_torch",             # standard AdamW
     )
+
     
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False
     )
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
     
     trainer = Trainer(
         model=model,
@@ -323,6 +441,18 @@ def train_model(train_data, val_data, model_path, tokenizer, model):
 SAN_RE = re.compile(r"\b(O-O-O|O-O|[KQRNB]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRNB])?[+#]?)\b")
 
 
+def extract_xml_tag(text, tag):
+    """
+    Extract inner text from <tag>...</tag>, case-insensitive.
+    Returns "" if not found.
+    """
+    pattern = rf"<{tag}>(.*?)</{tag}>"
+    m = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
 class StopAfterBestMove(StoppingCriteria):
     """Stop generation after detecting a move following 'Best Move:'"""
     def __init__(self, tokenizer, start_idx):
@@ -338,65 +468,60 @@ class StopAfterBestMove(StoppingCriteria):
         tail = text[i + len(self.marker):]
         return SAN_RE.search(tail) is not None
 
-
 def query_model(fen, tokenizer, model, idx=None):
-    """Query model and return (san_move, full_reply)."""
+    """Query model and return (san_move, full_reply) using XML template."""
     board = chess.Board(fen)
     side_to_move = "White" if board.turn == chess.WHITE else "Black"
-    board_display = board.unicode(empty_square="·", borders=True)
 
-    messages = [
-        {"role": "system", "content":
-            "You are a chess assistant. Reply with exactly two lines:\n"
-            "My reasoning: <15 words max>\n"
-            "Best Move: <legal SAN only>"
-        },
-        {"role": "user", "content":
-            f"Side to move: {side_to_move}\nBoard:\n{board_display}"
-        },
-    ]
+    system_msg = (
+        "You are a strong chess assistant that answers strictly in XML.\n"
+        "Produce exactly and only the following tags, in this order:\n"
+        "<board_position>...</board_position>\n"
+        "<evaluate>...</evaluate>\n"
+        "<perceive>...</perceive>\n"
+        "<predict>...</predict>\n"
+        "<choose>...</choose>\n"
+    )
+
+    user_msg = f"FEN: {fen}"
 
     if hasattr(tokenizer, "apply_chat_template"):
         prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
         )
     else:
-        # simple instruct-style fallback
         prompt_text = (
-            "You are a chess assistant. Reply with exactly two lines:\n"
-            "My reasoning: <15 words max>\n"
-            "Best Move: <legal SAN only>\n\n"
-            f"Side to move: {side_to_move}\nBoard:\n{board_display}\n"
-            "Answer:\n"
+            system_msg + "\n\nUser:\n" + user_msg + "\n\nAssistant:\n"
         )
 
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
     with torch.no_grad():
-        stopping_criteria = StoppingCriteriaList([StopAfterBestMove(tokenizer, input_len)])
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=128,
+            max_new_tokens=512,
             do_sample=False,
             no_repeat_ngram_size=5,
-            repetition_penalty=1.1,
+            repetition_penalty=1.05,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             eos_token_id=getattr(tokenizer, "eos_token_id", None),
-            stopping_criteria=stopping_criteria,
         )
 
     new_tokens = output_ids[0, input_len:]
     completion = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    # Parse after "Best Move:"
-    window = completion
-    j = window.lower().rfind("best move:")
-    window = window[j + len("best move:"):].strip() if j != -1 else ""
-
+    # Extract <choose> and parse a SAN move from it
+    choose_content = extract_xml_tag(completion, "choose")
     san = ""
-    if window:
-        m = SAN_RE.search(window)
+
+    if choose_content:
+        m = SAN_RE.search(choose_content)
         cand = m.group(1) if m else ""
         if cand:
             cleaned = re.sub(r"[+#]+$", "", cand.strip())
@@ -405,16 +530,18 @@ def query_model(fen, tokenizer, model, idx=None):
                 san = board.san(mv)
             except Exception:
                 for move in board.legal_moves:
-                    if board.san(move).replace("+", "").replace("#", "").lower() == cleaned.lower():
-                        san = board.san(move)
+                    san_str = board.san(move)
+                    if san_str.replace("+", "").replace("#", "").lower() == cleaned.lower():
+                        san = san_str
                         break
 
     if idx is not None:
         print(f"[EVAL] #{idx}: SAN='{san}'")
         if not san:
-            print("[WARN] Could not parse a valid SAN after 'Best Move:'.")
-    
+            print("[WARN] Could not parse a valid SAN from <choose>.")
+
     return san, completion
+
 
 
 def evaluate_move(fen, move_san, top_moves_san):
@@ -499,59 +626,80 @@ def evaluate_model(test_data, tokenizer, model, model_name):
 # =========================================================
 # Model Loading
 # =========================================================
-def load_model(model_path, for_training=False, force_dtype=None):
-    print(f"\n[MODEL] Loading model from: {model_path}")
+def load_model(model_path, for_training=False, force_dtype=None, use_lora=False, peft_dir=None):
+    print(f"\n[MODEL] Loading FULL model (no LoRA). for_training={for_training}")
     start = time.time()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=False,
+    )
 
     if force_dtype is not None:
         dtype = force_dtype
     else:
-        dtype = torch.bfloat16 if for_training else (torch.float16 if device == "cuda" else torch.float32)
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
+    # Load full model, all weights trainable
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=False,
         torch_dtype=dtype,
-        device_map="auto",
-        attn_implementation="eager",   # ← avoids SDPA/Flash cache quirks
+        device_map="auto",  # or "cuda" if single GPU
     )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
 
-    # Be explicit: no KV cache anywhere
+    # Important for training with gradient checkpointing
     model.config.use_cache = False
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.use_cache = False
 
     if not for_training:
         model.eval()
+    else:
+        model.train()  # make sure in train mode
 
-    print(f"[MODEL] Loaded in {time.time()-start:.1f}s | dtype={dtype}")
+    print(f"[MODEL] Loaded in {time.time()-start:.1f}s")
     return tokenizer, model
 
 
 def ensure_model_downloaded(model_id):
-    """Ensure model is downloaded locally."""
+    """Ensure model is available locally.
+
+    If `model_id` is a local directory (contains a HF model),
+    just return it. Otherwise, treat it as a HF Hub repo id
+    and cache it under `models_dir`.
+    """
+    # 1) Local directory case: use as-is
+    if os.path.isdir(model_id):
+        print(f"[LOCAL] Using existing local model directory: {model_id}")
+        return model_id
+
+    # 2) If it looks like a path but doesn't exist, fail early
+    if any(sep in model_id for sep in (os.sep, "\\")):
+        raise ValueError(f"[ERROR] Model path '{model_id}' does not exist or is not a directory.")
+
+    # 3) HF Hub repo id case – cache under models/
     local_model_dir = os.path.join(models_dir, sanitize_repo_id(model_id))
-    
+
     def has_required_files(path):
         if not os.path.isdir(path):
             return False
         has_config = os.path.isfile(os.path.join(path, "config.json"))
         has_weights = any(
-            fn.endswith(".safetensors") or (fn.startswith("pytorch_model") and fn.endswith(".bin"))
+            fn.endswith(".safetensors")
+            or (fn.startswith("pytorch_model") and fn.endswith(".bin"))
             for fn in os.listdir(path)
         )
         has_tok = (
-            os.path.isfile(os.path.join(path, "tokenizer.json")) or
-            os.path.isfile(os.path.join(path, "tokenizer.model"))
+            os.path.isfile(os.path.join(path, "tokenizer.json"))
+            or os.path.isfile(os.path.join(path, "tokenizer.model"))
         )
         return has_config and has_weights and has_tok
-    
+
     if not has_required_files(local_model_dir):
         print(f"[DOWNLOAD] Fetching '{model_id}' into {local_model_dir}...")
         snapshot_download(
@@ -559,13 +707,14 @@ def ensure_model_downloaded(model_id):
             local_dir=local_model_dir,
             local_dir_use_symlinks=False,
             allow_patterns=None,
-            ignore_patterns=None
+            ignore_patterns=None,
         )
         print(f"[DOWNLOAD] Completed: {local_model_dir}")
     else:
         print(f"[CACHE] Using existing local model at {local_model_dir}")
-    
+
     return local_model_dir
+
 
 
 # =========================================================
@@ -579,57 +728,131 @@ def main():
     print(f"Base model: {args.model}")
     print(f"Dataset: {args.dataset}")
     eval_dtype = _str_to_dtype(args.eval_dtype)
-    # Load and split data
+
+    # =====================================================
+    # Load data splits
+    # =====================================================
     if args.mode in ["train", "both"]:
         train_data, val_data, test_data = load_data_splits(
             args.dataset,
             args.train_samples,
             args.val_samples,
-            args.test_samples
+            args.test_samples,
         )
     else:
-        # Just need test data for evaluation
+        # eval-only: just need test data
         _, _, test_data = load_data_splits(
             args.dataset,
             0,
             0,
-            args.eval_samples
+            args.eval_samples,
         )
-    
+
+    # =====================================================
     # Training phase
+    # =====================================================
     if args.mode in ["train", "both"]:
-        # Download base model
+        # Download base model (or use cached)
         local_model_path = ensure_model_downloaded(args.model)
-        tokenizer, model = load_model(local_model_path, for_training=True)
-        
-        # Train
+
+        # Load model for training (QLoRA if USE_LORA=True)
+        tokenizer, model = load_model(
+            local_model_path,
+            for_training=True,
+            use_lora=USE_LORA,
+        )
+
+        # Fine-tune
         trained_model = train_model(train_data, val_data, local_model_path, tokenizer, model)
-        
-        # For "both" mode, reload the trained model for evaluation
+
+        # If we also need to evaluate in this run, reload the trained model
         if args.mode == "both":
             print("\n[INFO] Reloading trained model for evaluation...")
-            tokenizer, model = load_model(args.output_dir, for_training=False, force_dtype=eval_dtype)
-            model_name = f"finetuned_{sanitize_repo_id(args.model)}"
+            if USE_LORA:
+                # For LoRA, load adapter from args.output_dir
+                tokenizer, model = load_model(
+                    model_path=None,
+                    for_training=False,
+                    force_dtype=eval_dtype,
+                    use_lora=True,
+                    peft_dir=args.output_dir,
+                )
+                model_name = f"lora_{sanitize_repo_id(args.model)}"
+            else:
+                tokenizer, model = load_model(
+                    args.output_dir,
+                    for_training=False,
+                    force_dtype=eval_dtype,
+                    use_lora=False,
+                )
+                model_name = f"finetuned_{sanitize_repo_id(args.model)}"
 
-    
+    # =====================================================
     # Evaluation phase
+    # =====================================================
     if args.mode in ["eval", "both"]:
         if args.mode == "eval":
-            if os.path.exists(args.output_dir) and os.path.isfile(
-                os.path.join(args.output_dir, "config.json")
-            ):
-                print(f"[INFO] Evaluating fine-tuned model from {args.output_dir}")
-                tokenizer, model = load_model(args.output_dir, for_training=False, force_dtype=eval_dtype)
-                model_name = f"finetuned_{sanitize_repo_id(args.model)}"
+            # Helper: does a directory look like a LoRA adapter or a full HF model?
+            def _has_file(path, name):
+                return os.path.isdir(path) and os.path.isfile(os.path.join(path, name))
+
+            chosen_dir = None
+            is_lora_adapter = False
+
+            # 1) Prefer explicit --eval_dir if given
+            if args.eval_dir is not None:
+                if _has_file(args.eval_dir, "adapter_config.json"):
+                    chosen_dir = args.eval_dir
+                    is_lora_adapter = True
+                elif _has_file(args.eval_dir, "config.json"):
+                    chosen_dir = args.eval_dir
+                    is_lora_adapter = False
+
+            # 2) Fall back to --output_dir
+            if chosen_dir is None:
+                if _has_file(args.output_dir, "adapter_config.json"):
+                    chosen_dir = args.output_dir
+                    is_lora_adapter = True
+                elif _has_file(args.output_dir, "config.json"):
+                    chosen_dir = args.output_dir
+                    is_lora_adapter = False
+
+            if chosen_dir is not None:
+                if is_lora_adapter:
+                    print(f"[INFO] Evaluating LoRA adapter from {chosen_dir}")
+                    tokenizer, model = load_model(
+                        model_path=None,
+                        for_training=False,
+                        force_dtype=eval_dtype,
+                        use_lora=True,
+                        peft_dir=chosen_dir,
+                    )
+                    model_name = f"lora_{sanitize_repo_id(os.path.basename(chosen_dir))}"
+                else:
+                    print(f"[INFO] Evaluating full model from {chosen_dir}")
+                    tokenizer, model = load_model(
+                        chosen_dir,
+                        for_training=False,
+                        force_dtype=eval_dtype,
+                        use_lora=False,
+                    )
+                    model_name = f"finetuned_{sanitize_repo_id(os.path.basename(chosen_dir))}"
             else:
+                # 3) Fall back to the base (unfine-tuned) model
                 print(f"[INFO] Evaluating base model: {args.model}")
                 local_model_path = ensure_model_downloaded(args.model)
-                tokenizer, model = load_model(local_model_path, for_training=False, force_dtype=eval_dtype)
+                tokenizer, model = load_model(
+                    local_model_path,
+                    for_training=False,
+                    force_dtype=eval_dtype,
+                    use_lora=False,
+                )
                 model_name = sanitize_repo_id(args.model)
-        
-        # Evaluate
+
+        # In "both" mode, tokenizer/model/model_name were set in the training block.
+        print(f"[INFO] model: {model_name}")
         results_df = evaluate_model(test_data, tokenizer, model, model_name)
-    
+
     print("\n" + "="*60)
     print("COMPLETED")
     print("="*60)

@@ -31,6 +31,7 @@ conda_envs/
 # HPC + Jupyter + VSCode metadata
 # ===============================
 ft_model/
+ft_model_*/
 *.swp
 *.swo
 *.bak
